@@ -1,0 +1,14 @@
+{
+  "name": "com.immersive.composition",
+  "displayName": "Immersive Composition",
+  "version": "0.1.0-preview.1",
+  "description": "Engine-independent keyed content composition kernel for Immersive packages.",
+  "unity": "6000.5",
+  "unityRelease": "0f1",
+  "license": "MIT",
+  "author": {
+    "name": "Immersive Games",
+    "url": "http://www.immersivegame.com.br",
+    "email": "contato@immersivegames.com.br"
+  }
+}
