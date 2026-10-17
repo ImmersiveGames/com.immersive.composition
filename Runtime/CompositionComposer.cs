@@ -888,7 +888,11 @@ namespace Immersive.Composition
             }
 
             List<CompositionIssue> releaseIssues = await ReleaseStagedAsync(staged);
-            issues.AddRange(releaseIssues);
+            foreach (CompositionIssue releaseIssue in releaseIssues)
+            {
+                issues.Add(releaseIssue);
+            }
+
             CompositionResultStatus status = releaseIssues.Count > 0 ? CompositionResultStatus.Degraded : requestedStatus;
             return Result(status, operation.Id, Revision, false, null, issues);
         }
@@ -954,7 +958,11 @@ namespace Immersive.Composition
             }
 
             QueueReleaseRecords(operation, detachedRecords);
-            issues.AddRange(await ReleaseStagedAsync(staged));
+            List<CompositionIssue> releaseIssues = await ReleaseStagedAsync(staged);
+            foreach (CompositionIssue releaseIssue in releaseIssues)
+            {
+                issues.Add(releaseIssue);
+            }
 
             return Result(
                 effects.Count > 0 || uncertainDetach.Count > 0 || uncertainApply.Count > 0
