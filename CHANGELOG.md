@@ -2,6 +2,13 @@
 
 All notable changes to this package are documented here.
 
+## [0.1.0-preview.3] - 2026-10-18 — signed GitHub Release published; OpenUPM installability unverified
+
+- Publishes the existing Experimental composition kernel as a signed GitHub Release.
+- OpenUPM metadata is present in the merged index change; registry listing and installation of this version have not been verified here.
+- No Runtime or public API changes from `0.1.0-preview.2`.
+- Registry installs resolve Composition transitively through Framework. Git-source Framework projects declare custom Git dependencies directly in the project manifest; this does not authorize a parallel Actor Composer.
+
 ## [0.1.0-preview.2] - 2026-10-18 — local Experimental candidate; unpublished
 
 - Adds owner-scoped external-target guards, including invalidation of stale guarded winners in affected dependency closures, late acquisition cleanup and cancellation during preparation.
