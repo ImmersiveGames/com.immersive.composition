@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented here.
 
+## [0.1.0-preview.3] - 2026-10-18 — OpenUPM candidate; unpublished
+
+- Prepares the existing Experimental composition kernel for signed GitHub Release and OpenUPM distribution.
+- No Runtime or public API changes from `0.1.0-preview.2`.
+- Framework consumes this package transitively; Framework Actor consumers should not add a second direct Composition source.
+
 ## [0.1.0-preview.2] - 2026-10-18 — local Experimental candidate; unpublished
 
 - Adds owner-scoped external-target guards, including invalidation of stale guarded winners in affected dependency closures, late acquisition cleanup and cancellation during preparation.

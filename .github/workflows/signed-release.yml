@@ -1,0 +1,166 @@
+name: Sign and release UPM package
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: signed-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Sign, release and publish
+    runs-on: ubuntu-latest
+    env:
+      UPM_SERVICE_ACCOUNT_KEY_ID: ${{ secrets.UPM_SERVICE_ACCOUNT_KEY_ID }}
+      UPM_SERVICE_ACCOUNT_KEY_SECRET: ${{ secrets.UPM_SERVICE_ACCOUNT_KEY_SECRET }}
+      UPM_ORG_ID: ${{ secrets.UPM_ORG_ID }}
+      DIST_DIR: /tmp/signed-upm-dist
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read and verify package metadata
+        id: package
+        shell: bash
+        run: |
+          package_name="$(jq -r '.name' package.json)"
+          package_version="$(jq -r '.version' package.json)"
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          if [ "$package_name" != "com.immersive.composition" ]; then
+            printf 'Unexpected package name: %s\n' "$package_name" >&2
+            exit 1
+          fi
+
+          test -n "$package_name"
+          test -n "$package_version"
+          if [ "$tag_version" != "$package_version" ]; then
+            printf 'Tag version %s does not match package version %s\n' "$tag_version" "$package_version" >&2
+            exit 1
+          fi
+
+          git fetch origin 'refs/heads/main:refs/remotes/origin/main' --no-tags
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            printf 'Tagged source %s is not reachable from origin/main\n' "$GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          echo "PACKAGE_NAME=$package_name" >> "$GITHUB_ENV"
+          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
+          echo "name=$package_name" >> "$GITHUB_OUTPUT"
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+          printf 'Package: %s@%s\n' "$package_name" "$package_version"
+
+      - name: Install Unity UPM CLI
+        shell: bash
+        run: |
+          curl -fsSL https://cdn.packages.unity.com/upm-cli/install.sh -o /tmp/upm-cli-install.sh
+          bash /tmp/upm-cli-install.sh
+          echo "$HOME/.upm/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Unity UPM CLI
+        run: upm --help
+
+      - name: Sign package
+        shell: bash
+        run: |
+          mkdir -p "$DIST_DIR"
+          upm pack . --organization-id "$UPM_ORG_ID" --destination "$DIST_DIR"
+
+      - name: Verify signed archive
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=("$DIST_DIR"/*.tgz "$DIST_DIR"/*.tar.gz)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            printf 'Expected one signed archive, found %s\n' "${#archives[@]}" >&2
+            exit 1
+          fi
+
+          archive="${archives[0]}"
+          if ! archive_listing="$(tar -tzf "$archive")"; then
+            printf 'Unable to list signed archive: %s\n' "$archive" >&2
+            exit 1
+          fi
+
+          has_archive_entry() {
+            local expected="$1"
+            local entry
+            while IFS= read -r entry; do
+              if [ "$entry" = "$expected" ]; then
+                return 0
+              fi
+            done <<< "$archive_listing"
+            return 1
+          }
+
+          if ! has_archive_entry 'package/package.json'; then
+            printf 'Signed archive is missing required entry: package/package.json\n' >&2
+            exit 1
+          fi
+          if ! has_archive_entry 'package/.attestation.p7m'; then
+            printf 'Signed archive is missing required entry: package/.attestation.p7m\n' >&2
+            exit 1
+          fi
+          if ! attestation_size="$(tar -xOzf "$archive" package/.attestation.p7m | wc -c)"; then
+            printf 'Unable to extract signature attestation from signed archive\n' >&2
+            exit 1
+          fi
+          attestation_size="${attestation_size//[[:space:]]/}"
+          case "$attestation_size" in
+            ''|*[!0-9]*) printf 'Invalid signature attestation size: %s\n' "$attestation_size" >&2; exit 1 ;;
+          esac
+          if [ "$attestation_size" -eq 0 ]; then
+            printf 'Signed archive has an empty signature attestation\n' >&2
+            exit 1
+          fi
+
+          if ! archive_json="$(tar -xOzf "$archive" package/package.json)"; then
+            printf 'Unable to extract package/package.json from signed archive\n' >&2
+            exit 1
+          fi
+          if ! archive_name="$(jq -er '.name | strings' <<< "$archive_json")"; then
+            printf 'Signed archive has invalid package name metadata\n' >&2
+            exit 1
+          fi
+          if ! archive_version="$(jq -er '.version | strings' <<< "$archive_json")"; then
+            printf 'Signed archive has invalid package version metadata\n' >&2
+            exit 1
+          fi
+          if [ "$archive_name" != "$PACKAGE_NAME" ]; then
+            printf 'Package name mismatch: expected %s, found %s\n' "$PACKAGE_NAME" "$archive_name" >&2
+            exit 1
+          fi
+          if [ "$archive_version" != "$PACKAGE_VERSION" ]; then
+            printf 'Package version mismatch: expected %s, found %s\n' "$PACKAGE_VERSION" "$archive_version" >&2
+            exit 1
+          fi
+          echo "path=$archive" >> "$GITHUB_OUTPUT"
+          printf 'Signed archive: %s\n' "$(basename "$archive")"
+
+      - name: Create GitHub Release and upload signed archive
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.package.outputs.name }} ${{ steps.package.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ${{ steps.archive.outputs.path }}
+
+      - name: Publish signed archive through OpenUPM
+        uses: openupm/openupm-action@v1
+        with:
+          package: ${{ steps.package.outputs.name }}
+          tag: ${{ github.ref_name }}
+          timeout-minutes: 30
