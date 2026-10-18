@@ -38,6 +38,7 @@ namespace Immersive.Composition
         public CompositionOwnerId ContributionOwnerId { get; }
         public ContentKey Key { get; }
         public long ObservedRevision { get; }
+        public bool IsClosingContext { get; }
         public IReadOnlyList<ContentKey> AffectedKeys => _affectedKeys;
 
         internal PartMaterializationContext(
@@ -46,6 +47,7 @@ namespace Immersive.Composition
             CompositionOwnerId contributionOwnerId,
             ContentKey key,
             long observedRevision,
+            bool isClosingContext,
             IReadOnlyCollection<ContentKey> affectedKeys)
         {
             ContextId = contextId;
@@ -53,6 +55,7 @@ namespace Immersive.Composition
             ContributionOwnerId = contributionOwnerId;
             Key = key;
             ObservedRevision = observedRevision;
+            IsClosingContext = isClosingContext;
 
             var keys = new List<ContentKey>(affectedKeys);
             _affectedKeys = Array.AsReadOnly(keys.ToArray());

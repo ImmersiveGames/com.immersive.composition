@@ -2,7 +2,7 @@
 
 `com.immersive.composition` is an independent, engine-free keyed composition kernel. It reconciles owner contributions into materialized parts without knowing Unity objects or Immersive Framework lifecycle concepts.
 
-The package is at **0.1.0-preview.1**. Every consumer-facing contract is **Experimental** under the Framework API maturity governance: signatures and behavior may change before a Stable baseline. The package contains no serialized Unity schema.
+The local candidate is **0.1.0-preview.2**. Every consumer-facing contract is **Experimental** under the Framework API maturity governance: signatures and behavior may change before a Stable baseline. The package contains no serialized Unity schema.
 
 ## Core flow
 
@@ -17,6 +17,8 @@ CompositionResult result = await baseVisual.SetPartAsync(
 ```
 
 Contribution owners own desired intent. They do not automatically own the resources or root represented by a part. Materializers define how acquired and adopted resources are applied, detached, and released.
+
+Call `SetPartWhileCurrentAsync`, `SetPartsWhileCurrentAsync`, or `RemovePartWhileCurrentAsync` when an operation is bound to an external target such as a physical Actor occurrence. The Composer checks the initiating target and guarded winners in the affected dependency closure after preparation and throughout the serialized effect phase. A stale contribution is invalidated when observed, and staged work is released without being applied. `CloseAsync` remains available for cleanup after the external target is no longer current.
 
 ## Boundaries
 

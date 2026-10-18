@@ -85,6 +85,15 @@ namespace Immersive.Composition
             IEnumerable<PartDefinition> definitions,
             CancellationToken cancellationToken)
         {
+            return SetPartsAsync(contribution, definitions, null, cancellationToken);
+        }
+
+        internal Task<CompositionResult> SetPartsAsync(
+            CompositionContribution contribution,
+            IEnumerable<PartDefinition> definitions,
+            Func<bool> isTargetCurrent,
+            CancellationToken cancellationToken)
+        {
             if (definitions == null)
             {
                 throw new ArgumentNullException(nameof(definitions));
@@ -120,7 +129,8 @@ namespace Immersive.Composition
                     "At least one part definition is required."));
             }
 
-            return ChangeContributionAsync(contribution, definitionList, null, false, cancellationToken);
+            return ChangeContributionAsync(
+                contribution, definitionList, null, false, isTargetCurrent, cancellationToken);
         }
 
         internal Task<CompositionResult> RemovePartAsync(
@@ -128,19 +138,29 @@ namespace Immersive.Composition
             ContentKey key,
             CancellationToken cancellationToken)
         {
+            return RemovePartAsync(contribution, key, null, cancellationToken);
+        }
+
+        internal Task<CompositionResult> RemovePartAsync(
+            CompositionContribution contribution,
+            ContentKey key,
+            Func<bool> isTargetCurrent,
+            CancellationToken cancellationToken)
+        {
             if (!key.IsValid)
             {
                 throw new ArgumentException("A valid content key is required.", nameof(key));
             }
 
-            return ChangeContributionAsync(contribution, null, new[] { key }, false, cancellationToken);
+            return ChangeContributionAsync(
+                contribution, null, new[] { key }, false, isTargetCurrent, cancellationToken);
         }
 
         internal Task<CompositionResult> CloseContributionAsync(
             CompositionContribution contribution,
             CancellationToken cancellationToken)
         {
-            return ChangeContributionAsync(contribution, null, null, true, cancellationToken);
+            return ChangeContributionAsync(contribution, null, null, true, null, cancellationToken);
         }
 
         private async Task<CompositionResult> CloseContextAsync(CancellationToken cancellationToken)
@@ -209,6 +229,7 @@ namespace Immersive.Composition
                     new Dictionary<ContentKey, Winner>(),
                     Array.Empty<CompositionIssue>(),
                     true,
+                    null,
                     cancellationToken,
                     cancellations);
             }
@@ -222,6 +243,7 @@ namespace Immersive.Composition
             IReadOnlyList<PartDefinition> definitionsToSet,
             IReadOnlyCollection<ContentKey> keysToRemove,
             bool closeOwner,
+            Func<bool> isTargetCurrent,
             CancellationToken cancellationToken)
         {
             if (contribution == null)
@@ -235,8 +257,40 @@ namespace Immersive.Composition
                     "The operation was cancelled before changing contribution intent."));
             }
 
+            ContributionState observedOwner = null;
+            if (!closeOwner && isTargetCurrent != null)
+            {
+                lock (_sync)
+                {
+                    if (_owners.TryGetValue(contribution.OwnerId, out ContributionState owner) &&
+                        ReferenceEquals(owner.Handle, contribution) && !owner.IsTargetInvalidated)
+                    {
+                        owner.IsTargetCurrent ??= isTargetCurrent;
+                        observedOwner = owner;
+                    }
+                }
+            }
+
+            if (!IsExternalTargetCurrent(isTargetCurrent, out string externalTargetIssue))
+            {
+                if (observedOwner != null)
+                {
+                    InvalidateContributionTarget(observedOwner);
+                }
+
+                InvalidateStaleContributionTargets();
+                return Task.FromResult(Immediate(
+                    CompositionResultStatus.Stale,
+                    CompositionIssueCode.StaleOperation,
+                    default,
+                    $"The caller's exact external target is no longer current. {externalTargetIssue}"));
+            }
+
+            List<CompositionIssue> targetInvalidationIssues = InvalidateStaleContributionTargets();
+
             Operation operation;
             List<CancellationTokenSource> cancellations;
+            Func<bool> effectiveTargetGuard;
             lock (_sync)
             {
                 if (_closed)
@@ -262,6 +316,20 @@ namespace Immersive.Composition
                     return Task.FromResult(Immediate(CompositionResultStatus.Rejected, CompositionIssueCode.OwnerClosed, default,
                         "The contribution owner is not open in this composition context."));
                 }
+
+                if (!closeOwner && owner.IsTargetInvalidated)
+                {
+                    return Task.FromResult(Immediate(CompositionResultStatus.Stale,
+                        CompositionIssueCode.StaleOperation, default,
+                        "This contribution's external target was invalidated and cannot accept further intent."));
+                }
+
+                if (!closeOwner && isTargetCurrent != null)
+                {
+                    owner.IsTargetCurrent ??= isTargetCurrent;
+                }
+
+                effectiveTargetGuard = closeOwner ? null : isTargetCurrent ?? owner.IsTargetCurrent;
 
                 if (!closeOwner && keysToRemove != null)
                 {
@@ -336,6 +404,22 @@ namespace Immersive.Composition
                 Dictionary<ContentKey, PartDefinition> currentParts = DefinitionsFromParts(_parts);
                 var seeds = GetWinnerChanges(oldWinners, newWinners);
 
+                if (closeOwner)
+                {
+                    if (!owner.IsTargetInvalidated)
+                    {
+                        seeds.UnionWith(owner.Entries.Keys);
+                    }
+
+                    foreach (KeyValuePair<ContentKey, PartRecord> pair in _parts)
+                    {
+                        if (pair.Value.Winner.OwnerId == contribution.OwnerId)
+                        {
+                            seeds.Add(pair.Key);
+                        }
+                    }
+                }
+
                 if (definitionsToSet != null)
                 {
                     for (int i = 0; i < definitionsToSet.Count; i++)
@@ -408,11 +492,13 @@ namespace Immersive.Composition
                     targets,
                     targetIssues,
                     false,
+                    effectiveTargetGuard,
                     cancellationToken,
                     cancellations);
             }
 
             operation.CancellationIssues.AddRange(CancelOperations(cancellations));
+            operation.CancellationIssues.AddRange(targetInvalidationIssues);
             return ExecuteOperationAsync(operation);
         }
 
@@ -423,10 +509,32 @@ namespace Immersive.Composition
             Dictionary<ContentKey, Winner> targets,
             IReadOnlyList<CompositionIssue> graphIssues,
             bool closeContext,
+            Func<bool> isTargetCurrent,
             CancellationToken cancellationToken,
             ICollection<CancellationTokenSource> cancellations)
         {
             var operationId = new CompositionOperationId(Guid.NewGuid());
+            var guardedTargets = new List<ContributionState>();
+            var guardedOwnerIds = new HashSet<CompositionOwnerId>();
+            if (initiatingOwnerId.IsValid)
+            {
+                guardedOwnerIds.Add(initiatingOwnerId);
+            }
+
+            foreach (ContentKey key in lockKeys)
+            {
+                if (!targets.TryGetValue(key, out Winner winner) ||
+                    guardedOwnerIds.Contains(winner.OwnerId) ||
+                    !_owners.TryGetValue(winner.OwnerId, out ContributionState owner) ||
+                    owner.IsTargetInvalidated || owner.IsTargetCurrent == null)
+                {
+                    continue;
+                }
+
+                guardedOwnerIds.Add(winner.OwnerId);
+                guardedTargets.Add(owner);
+            }
+
             foreach (ContentKey key in lockKeys)
             {
                 if (_latestOperationByKey.TryGetValue(key, out CompositionOperationId previousId) &&
@@ -449,7 +557,89 @@ namespace Immersive.Composition
                 new Dictionary<ContentKey, Winner>(targets),
                 new List<CompositionIssue>(graphIssues),
                 closeContext,
+                isTargetCurrent,
+                guardedTargets,
                 source);
+        }
+
+        private List<CompositionIssue> InvalidateStaleContributionTargets()
+        {
+            ContributionState[] guardedOwners;
+            lock (_sync)
+            {
+                guardedOwners = _owners.Values
+                    .Where(owner => !owner.IsTargetInvalidated && owner.IsTargetCurrent != null)
+                    .ToArray();
+            }
+
+            var issues = new List<CompositionIssue>();
+            foreach (ContributionState owner in guardedOwners)
+            {
+                if (!IsExternalTargetCurrent(owner.IsTargetCurrent, out _))
+                {
+                    issues.AddRange(InvalidateContributionTarget(owner));
+                }
+            }
+
+            return issues;
+        }
+
+        private List<CompositionIssue> InvalidateContributionTarget(ContributionState observedOwner)
+        {
+            var cancellations = new List<CancellationTokenSource>();
+            lock (_sync)
+            {
+                if (_closed || observedOwner == null ||
+                    !_owners.TryGetValue(observedOwner.Handle.OwnerId, out ContributionState owner) ||
+                    !ReferenceEquals(owner, observedOwner) || owner.IsTargetInvalidated)
+                {
+                    return new List<CompositionIssue>();
+                }
+
+                Dictionary<ContentKey, Winner> oldWinners = ResolveWinners(_owners, out _);
+                owner.IsTargetInvalidated = true;
+                Dictionary<ContentKey, Winner> newWinners = ResolveWinners(_owners, out _);
+                Dictionary<ContentKey, PartDefinition> oldDefinitions = DefinitionsFromWinners(oldWinners);
+                Dictionary<ContentKey, PartDefinition> newDefinitions = DefinitionsFromWinners(newWinners);
+                Dictionary<ContentKey, PartDefinition> currentParts = DefinitionsFromParts(_parts);
+                MergeDefinitions(oldDefinitions, currentParts);
+                MergeDefinitions(newDefinitions, currentParts);
+                HashSet<ContentKey> seeds = GetWinnerChanges(oldWinners, newWinners);
+                seeds.UnionWith(owner.Entries.Keys);
+                foreach (KeyValuePair<ContentKey, PartRecord> pair in _parts)
+                {
+                    if (pair.Value.Winner.OwnerId == owner.Handle.OwnerId)
+                    {
+                        seeds.Add(pair.Key);
+                    }
+                }
+
+                HashSet<ContentKey> actionKeys = CompositionGraph.ExpandDependents(
+                    seeds,
+                    oldDefinitions,
+                    newDefinitions,
+                    currentParts);
+                HashSet<ContentKey> lockKeys = CompositionGraph.ExpandDependencyClosure(
+                    actionKeys,
+                    oldDefinitions,
+                    newDefinitions,
+                    currentParts);
+                lockKeys.UnionWith(seeds);
+
+                foreach (ContentKey key in lockKeys)
+                {
+                    if (_latestOperationByKey.TryGetValue(key, out CompositionOperationId currentId) &&
+                        _activeOperations.TryGetValue(currentId, out CancellationTokenSource cancellation) &&
+                        !cancellations.Contains(cancellation))
+                    {
+                        cancellations.Add(cancellation);
+                    }
+
+                    _latestOperationByKey[key] = new CompositionOperationId(Guid.NewGuid());
+                }
+            }
+
+            return CancelOperations(cancellations);
         }
 
         private async Task<CompositionResult> ExecuteOperationAsync(Operation operation)
@@ -504,6 +694,14 @@ namespace Immersive.Composition
                     SemaphoreSlim gate = GetKeyGate(key);
                     await gate.WaitAsync(operation.Token);
                     acquiredGates.Add(gate);
+                }
+
+                if (!IsOperationTargetsCurrent(operation, out string targetAfterGateIssue))
+                {
+                    result = Result(CompositionResultStatus.Stale, operation.Id, Revision, false, null,
+                        AddIssue(issues, CompositionIssueCode.StaleOperation, default,
+                            $"An exact external target became stale before preparation. {targetAfterGateIssue}"));
+                    return result;
                 }
 
                 if (!IsOperationCurrent(operation))
@@ -569,12 +767,16 @@ namespace Immersive.Composition
                     }
 
                     staged.Add(key, new StagedPart(target, preparation.Materialization, context));
-                    if (!IsOperationCurrent(operation))
+                    string targetAfterPrepareIssue = string.Empty;
+                    bool targetsCurrent = IsOperationTargetsCurrent(operation, out targetAfterPrepareIssue);
+                    if (!targetsCurrent || !IsOperationCurrent(operation))
                     {
                         result = await FinishBeforeEffectsAsync(
                             operation, staged, issues, CompositionResultStatus.Stale,
                             CompositionIssueCode.StaleOperation, key,
-                            "The prepared result no longer matches its exact owner, key and operation.");
+                            string.IsNullOrEmpty(targetAfterPrepareIssue)
+                                ? "The prepared result no longer matches its exact owner, key, operation and external target."
+                                : $"The prepared result no longer matches its exact owner, key, operation and external target. {targetAfterPrepareIssue}");
                         return result;
                     }
                 }
@@ -601,6 +803,20 @@ namespace Immersive.Composition
                         IsOperationCurrent(operation) ? CompositionResultStatus.Cancelled : CompositionResultStatus.Stale,
                         CompositionIssueCode.Cancelled, default,
                         "The operation was cancelled before the serialized commit boundary.");
+                    return result;
+                }
+
+                if (!IsOperationTargetsCurrent(operation, out string targetBeforeApplicationIssue))
+                {
+                    ExitApplicationPhase(operation, ref applicationStarted, ref commitGateAcquired);
+                    result = await FinishBeforeEffectsAsync(
+                        operation,
+                        staged,
+                        issues,
+                        CompositionResultStatus.Stale,
+                        CompositionIssueCode.StaleOperation,
+                        default,
+                        $"An exact external target in the affected key closure became stale before application. {targetBeforeApplicationIssue}");
                     return result;
                 }
 
@@ -642,6 +858,13 @@ namespace Immersive.Composition
                 foreach (ContentKey key in previousOrder)
                 {
                     PartRecord previous = previousParts[key];
+                    if (!IsOperationTargetsCurrent(operation, out string targetBeforeDetachIssue))
+                    {
+                        issues.Add(new CompositionIssue(CompositionIssueCode.StaleOperation, key,
+                            $"An exact external target in the affected key closure became stale before detach. {targetBeforeDetachIssue}"));
+                        break;
+                    }
+
                     PartMaterializationContext context = CreateContext(operation, previous.Winner.OwnerId, key);
                     PartEffectResult detachResult;
                     try
@@ -675,6 +898,13 @@ namespace Immersive.Composition
                         effects.Add(key);
                     }
 
+                    if (!IsOperationTargetsCurrent(operation, out string targetAfterDetachIssue))
+                    {
+                        issues.Add(new CompositionIssue(CompositionIssueCode.StaleOperation, key,
+                            $"An exact external target in the affected key closure became stale during detach. {targetAfterDetachIssue}"));
+                        break;
+                    }
+
                     if (!IsOperationCurrent(operation))
                     {
                         issues.Add(new CompositionIssue(CompositionIssueCode.StaleOperation, key,
@@ -689,6 +919,13 @@ namespace Immersive.Composition
                 {
                     foreach (ContentKey key in targetOrder)
                     {
+                        if (!IsOperationTargetsCurrent(operation, out string targetBeforeApplyIssue))
+                        {
+                            issues.Add(new CompositionIssue(CompositionIssueCode.StaleOperation, key,
+                                $"An exact external target in the affected key closure became stale before application. {targetBeforeApplyIssue}"));
+                            break;
+                        }
+
                         StagedPart candidate = staged[key];
                         PartMaterialization previous = previousParts.TryGetValue(key, out PartRecord record)
                             ? record.Materialization
@@ -730,6 +967,13 @@ namespace Immersive.Composition
 
                         applied[key] = new PartRecord(candidate.Winner, candidate.Materialization, false);
                         staged.Remove(key);
+                        if (!IsOperationTargetsCurrent(operation, out string targetAfterApplyIssue))
+                        {
+                            issues.Add(new CompositionIssue(CompositionIssueCode.StaleOperation, key,
+                                $"An exact external target in the affected key closure became stale during application. {targetAfterApplyIssue}"));
+                            break;
+                        }
+
                         if (!IsOperationCurrent(operation))
                         {
                             issues.Add(new CompositionIssue(CompositionIssueCode.StaleOperation, key,
@@ -737,6 +981,13 @@ namespace Immersive.Composition
                             break;
                         }
                     }
+                }
+
+                if (!issues.Any(issue => issue.Code == CompositionIssueCode.StaleOperation) &&
+                    !IsOperationTargetsCurrent(operation, out string targetBeforeCommitIssue))
+                {
+                    issues.Add(new CompositionIssue(CompositionIssueCode.StaleOperation, default,
+                        $"An exact external target became stale before commit. {targetBeforeCommitIssue}"));
                 }
 
                 bool applyOrCloseFailure = issues.Any(issue =>
@@ -882,7 +1133,17 @@ namespace Immersive.Composition
             ContentKey key,
             string message)
         {
-            if (issueCode != CompositionIssueCode.None && !string.IsNullOrEmpty(message))
+            if (!IsOperationTargetsCurrent(operation, out string targetIssue))
+            {
+                requestedStatus = CompositionResultStatus.Stale;
+                issueCode = CompositionIssueCode.StaleOperation;
+                message = string.IsNullOrEmpty(message)
+                    ? $"An exact external target became stale before effects. {targetIssue}"
+                    : $"{message} An exact external target became stale before effects. {targetIssue}";
+            }
+
+            if (issueCode != CompositionIssueCode.None && !string.IsNullOrEmpty(message) &&
+                !issues.Any(issue => issue.Code == issueCode && issue.Key == key))
             {
                 issues.Add(new CompositionIssue(issueCode, key, message));
             }
@@ -908,6 +1169,13 @@ namespace Immersive.Composition
             ISet<ContentKey> effects,
             IList<CompositionIssue> issues)
         {
+            if (!IsOperationTargetsCurrent(operation, out string targetIssue) &&
+                !issues.Any(issue => issue.Code == CompositionIssueCode.StaleOperation))
+            {
+                issues.Add(new CompositionIssue(CompositionIssueCode.StaleOperation, default,
+                    $"An exact external target became stale after effects began. {targetIssue}"));
+            }
+
             long revision;
             var changed = effects.OrderBy(key => key).ToArray();
             lock (_sync)
@@ -964,13 +1232,16 @@ namespace Immersive.Composition
                 issues.Add(releaseIssue);
             }
 
+            bool hasUncertainEffects = effects.Count > 0 || uncertainDetach.Count > 0 || uncertainApply.Count > 0;
+            bool staleBeforeAnyEffect = !hasUncertainEffects &&
+                issues.Any(issue => issue.Code == CompositionIssueCode.StaleOperation);
             return Result(
-                effects.Count > 0 || uncertainDetach.Count > 0 || uncertainApply.Count > 0
+                hasUncertainEffects
                     ? CompositionResultStatus.Degraded
-                    : CompositionResultStatus.Faulted,
+                    : staleBeforeAnyEffect ? CompositionResultStatus.Stale : CompositionResultStatus.Faulted,
                 operation.Id,
                 revision,
-                effects.Count > 0 || uncertainDetach.Count > 0 || uncertainApply.Count > 0,
+                hasUncertainEffects,
                 changed,
                 issues);
         }
@@ -1165,6 +1436,7 @@ namespace Immersive.Composition
                 ownerId.IsValid ? ownerId : operation.InitiatingOwnerId,
                 key,
                 Revision,
+                operation.CloseContext,
                 operation.LockKeys.OrderBy(item => item).ToArray());
         }
 
@@ -1194,6 +1466,93 @@ namespace Immersive.Composition
             lock (_sync)
             {
                 return IsOperationCurrentLocked(operation);
+            }
+        }
+
+        private static bool IsExternalTargetCurrent(
+            Func<bool> isTargetCurrent,
+            out string issue)
+        {
+            issue = string.Empty;
+            if (isTargetCurrent == null)
+            {
+                return true;
+            }
+
+            try
+            {
+                bool isCurrent = isTargetCurrent();
+                if (!isCurrent)
+                {
+                    issue = "The target guard returned false.";
+                }
+
+                return isCurrent;
+            }
+            catch (Exception exception)
+            {
+                issue = $"The target guard threw {exception.GetType().Name}: {exception.Message}";
+                return false;
+            }
+        }
+
+        private bool IsOperationTargetsCurrent(Operation operation, out string issue)
+        {
+            issue = string.Empty;
+            if (operation == null)
+            {
+                return true;
+            }
+
+            var staleOwners = new List<ContributionState>();
+            bool allCurrent = true;
+            if (!IsExternalTargetCurrent(operation.IsTargetCurrent, out string initiatingIssue))
+            {
+                allCurrent = false;
+                ContributionState initiatingOwner = FindContributionState(operation.InitiatingOwnerId);
+                if (initiatingOwner != null)
+                {
+                    staleOwners.Add(initiatingOwner);
+                }
+
+                issue = $"The initiating contribution target is stale. {initiatingIssue}";
+            }
+
+            foreach (ContributionState guardedTarget in operation.GuardedTargets)
+            {
+                if (IsExternalTargetCurrent(guardedTarget.IsTargetCurrent, out string targetIssue))
+                {
+                    continue;
+                }
+
+                allCurrent = false;
+                staleOwners.Add(guardedTarget);
+                if (string.IsNullOrEmpty(issue))
+                {
+                    issue = $"A guarded contribution used by the target dependency closure is stale. {targetIssue}";
+                }
+            }
+
+            if (allCurrent)
+            {
+                return true;
+            }
+
+            foreach (ContributionState staleOwner in staleOwners.Distinct())
+            {
+                InvalidateContributionTarget(staleOwner);
+            }
+
+            return false;
+        }
+
+        private ContributionState FindContributionState(CompositionOwnerId ownerId)
+        {
+            lock (_sync)
+            {
+                return _owners.TryGetValue(ownerId, out ContributionState owner)
+                    ? owner
+                    : null;
             }
         }
 
@@ -1230,7 +1589,7 @@ namespace Immersive.Composition
             var candidates = new Dictionary<ContentKey, List<Winner>>();
             foreach (ContributionState owner in owners.Values)
             {
-                if (owner.IsClosed)
+                if (owner.IsClosed || owner.IsTargetInvalidated)
                 {
                     continue;
                 }
@@ -1408,6 +1767,8 @@ namespace Immersive.Composition
             public readonly CompositionContribution Handle;
             public readonly Dictionary<ContentKey, PartDefinition> Entries = new Dictionary<ContentKey, PartDefinition>();
             public bool IsClosed;
+            public bool IsTargetInvalidated;
+            public Func<bool> IsTargetCurrent;
 
             public ContributionState(CompositionContribution handle)
             {
@@ -1488,6 +1849,8 @@ namespace Immersive.Composition
             public readonly Dictionary<ContentKey, Winner> Targets;
             public readonly List<CompositionIssue> GraphIssues;
             public readonly bool CloseContext;
+            public readonly Func<bool> IsTargetCurrent;
+            public readonly List<ContributionState> GuardedTargets;
             public readonly CancellationTokenSource Cancellation;
             public CancellationToken Token => Cancellation.Token;
             public readonly List<CompositionIssue> CancellationIssues = new List<CompositionIssue>();
@@ -1501,6 +1864,8 @@ namespace Immersive.Composition
                 Dictionary<ContentKey, Winner> targets,
                 List<CompositionIssue> graphIssues,
                 bool closeContext,
+                Func<bool> isTargetCurrent,
+                List<ContributionState> guardedTargets,
                 CancellationTokenSource cancellation)
             {
                 Id = id;
@@ -1510,6 +1875,8 @@ namespace Immersive.Composition
                 Targets = targets;
                 GraphIssues = graphIssues;
                 CloseContext = closeContext;
+                IsTargetCurrent = isTargetCurrent;
+                GuardedTargets = guardedTargets;
                 Cancellation = cancellation;
             }
         }

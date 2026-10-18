@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Immersive.Composition;
 using NUnit.Framework;
@@ -196,6 +197,169 @@ namespace Immersive.Composition.Tests
             Assert.That(committed.Status, Is.EqualTo(CompositionResultStatus.Committed));
             Assert.That(materializer.DestroyedValues, Does.Contain("old"));
             Assert.That(materializer.Active[key], Is.EqualTo("current"));
+        }
+
+        [Test]
+        public async Task ExternalTargetChangeDuringPreparationRejectsBeforeMaterializerEffects()
+        {
+            var composer = new CompositionComposer();
+            var materializer = new RecordingMaterializer { BlockedDescriptor = "late-target" };
+            CompositionContribution owner = composer.CreateContribution(
+                CompositionOwnerId.Create("owner.external-target"), 1);
+            ContentKey key = ContentKey.Create("visual");
+            bool isTargetCurrent = true;
+
+            Task<CompositionResult> update = owner.SetPartWhileCurrentAsync(
+                Definition(key, "late-target", materializer),
+                () => isTargetCurrent);
+            await materializer.BlockedPreparationStarted.Task;
+            isTargetCurrent = false;
+            materializer.CompleteBlockedPreparation(PartOwnership.Acquired);
+
+            CompositionResult result = await update;
+
+            Assert.That(result.Status, Is.EqualTo(CompositionResultStatus.Stale));
+            Assert.That(result.EffectsMayHaveApplied, Is.False);
+            Assert.That(result.Revision, Is.Zero);
+            Assert.That(materializer.ApplyCalls, Is.Zero);
+            Assert.That(materializer.DestroyedValues, Does.Contain("late-target"));
+            Assert.That(materializer.Active, Is.Empty);
+            Assert.That((await composer.CloseAsync()).Status,
+                Is.EqualTo(CompositionResultStatus.NoChange));
+        }
+
+        [Test]
+        public async Task StaleGuardedIntentCannotWinALaterOwnerCommit()
+        {
+            var composer = new CompositionComposer();
+            var materializer = new RecordingMaterializer { BlockedDescriptor = "stale-target" };
+            CompositionContribution staleOwner = composer.CreateContribution(
+                CompositionOwnerId.Create("owner.stale-target"), 20);
+            CompositionContribution currentOwner = composer.CreateContribution(
+                CompositionOwnerId.Create("owner.current-target"), 10);
+            ContentKey key = ContentKey.Create("visual");
+            bool isTargetCurrent = true;
+
+            Task<CompositionResult> staleUpdate = staleOwner.SetPartWhileCurrentAsync(
+                Definition(key, "stale-target", materializer),
+                () => isTargetCurrent);
+            await materializer.BlockedPreparationStarted.Task;
+            isTargetCurrent = false;
+
+            Task<CompositionResult> currentUpdate = currentOwner.SetPartAsync(
+                Definition(key, "current-target", materializer));
+            materializer.CompleteBlockedPreparation(PartOwnership.Acquired);
+
+            CompositionResult staleResult = await staleUpdate;
+            CompositionResult currentResult = await currentUpdate;
+
+            Assert.That(staleResult.Status, Is.EqualTo(CompositionResultStatus.Stale));
+            Assert.That(materializer.DestroyedValues, Does.Contain("stale-target"));
+            Assert.That(currentResult.Status, Is.EqualTo(CompositionResultStatus.Committed));
+            Assert.That(materializer.Active[key], Is.EqualTo("current-target"),
+                "A later owner must not materialize intent rejected by the stale target guard.");
+            Assert.That(materializer.ApplyCalls, Is.EqualTo(1));
+        }
+
+        [Test]
+        public async Task GuardedOwnerRejectsUnguardedMutationAfterItsTargetBecomesStale()
+        {
+            var composer = new CompositionComposer();
+            var materializer = new RecordingMaterializer();
+            CompositionContribution guardedOwner = composer.CreateContribution(
+                CompositionOwnerId.Create("owner.expired-target"), 20);
+            CompositionContribution currentOwner = composer.CreateContribution(
+                CompositionOwnerId.Create("owner.live-target"), 10);
+            ContentKey key = ContentKey.Create("visual");
+            bool isTargetCurrent = true;
+
+            CompositionResult initial = await guardedOwner.SetPartWhileCurrentAsync(
+                Definition(key, "old-guarded-content", materializer),
+                () => isTargetCurrent);
+            Assert.That(initial.Status, Is.EqualTo(CompositionResultStatus.Committed));
+
+            isTargetCurrent = false;
+            CompositionResult staleAttempt = await guardedOwner.SetPartAsync(
+                Definition(key, "never-accepted-content", materializer),
+                CancellationToken.None);
+            CompositionResult replacement = await currentOwner.SetPartAsync(
+                Definition(key, "live-content", materializer));
+
+            Assert.That(staleAttempt.Status, Is.EqualTo(CompositionResultStatus.Stale));
+            Assert.That(replacement.Status, Is.EqualTo(CompositionResultStatus.Committed));
+            Assert.That(materializer.Active[key], Is.EqualTo("live-content"),
+                "Once its target is stale, a guarded owner's earlier intent must not retain precedence.");
+        }
+
+        [Test]
+        public async Task StaleGuardedWinnerIsInvalidatedWhenAnotherOwnersDependencyUpdateIsPreparing()
+        {
+            var composer = new CompositionComposer();
+            var materializer = new RecordingMaterializer();
+            CompositionContribution paletteOwner = composer.CreateContribution(
+                CompositionOwnerId.Create("owner.palette"), 10);
+            CompositionContribution visualOwner = composer.CreateContribution(
+                CompositionOwnerId.Create("owner.guarded-visual"), 20);
+            ContentKey paletteKey = ContentKey.Create("data.palette");
+            ContentKey visualKey = ContentKey.Create("visual.actor");
+            bool isVisualTargetCurrent = true;
+
+            CompositionResult initialPalette = await paletteOwner.SetPartAsync(
+                Definition(paletteKey, "palette.v1", materializer));
+            CompositionResult initialVisual = await visualOwner.SetPartWhileCurrentAsync(
+                Definition(visualKey, "visual.v1", materializer, paletteKey),
+                () => isVisualTargetCurrent);
+
+            Assert.That(initialPalette.Status, Is.EqualTo(CompositionResultStatus.Committed));
+            Assert.That(initialVisual.Status, Is.EqualTo(CompositionResultStatus.Committed));
+            Assert.That(materializer.Active[paletteKey], Is.EqualTo("palette.v1"));
+            Assert.That(materializer.Active[visualKey], Is.EqualTo("visual.v1"));
+            int applyCallsBeforeUpdate = materializer.ApplyCalls;
+            materializer.BlockedDescriptor = "palette.v2";
+
+            Task<CompositionResult> update = paletteOwner.SetPartAsync(
+                Definition(paletteKey, "palette.v2", materializer));
+            await materializer.BlockedPreparationStarted.Task;
+            isVisualTargetCurrent = false;
+            materializer.CompleteBlockedPreparation(PartOwnership.Acquired);
+
+            CompositionResult result = await update;
+
+            Assert.That(result.Status, Is.EqualTo(CompositionResultStatus.Stale));
+            Assert.That(result.EffectsMayHaveApplied, Is.False);
+            Assert.That(result.Revision, Is.EqualTo(2));
+            Assert.That(materializer.ApplyCalls, Is.EqualTo(applyCallsBeforeUpdate));
+            Assert.That(materializer.DestroyedValues, Does.Contain("palette.v2"));
+            Assert.That(materializer.Active[paletteKey], Is.EqualTo("palette.v1"));
+            Assert.That(materializer.Active[visualKey], Is.EqualTo("visual.v1"));
+            await composer.CloseAsync();
+        }
+
+        [Test]
+        public async Task CallerCancellationDuringPreparationReleasesLateAcquisitionWithoutApplying()
+        {
+            var composer = new CompositionComposer();
+            var materializer = new RecordingMaterializer { BlockedDescriptor = "cancelled-late" };
+            CompositionContribution owner = composer.CreateContribution(
+                CompositionOwnerId.Create("owner.cancelled-preparation"), 1);
+            ContentKey key = ContentKey.Create("visual");
+            using var cancellation = new CancellationTokenSource();
+
+            Task<CompositionResult> preparation = owner.SetPartAsync(
+                Definition(key, "cancelled-late", materializer),
+                cancellation.Token);
+            await materializer.BlockedPreparationStarted.Task;
+            cancellation.Cancel();
+            materializer.CompleteBlockedPreparation(PartOwnership.Acquired);
+
+            CompositionResult result = await preparation;
+
+            Assert.That(result.Status, Is.EqualTo(CompositionResultStatus.Cancelled));
+            Assert.That(result.EffectsMayHaveApplied, Is.False);
+            Assert.That(result.Revision, Is.Zero);
+            Assert.That(materializer.ApplyCalls, Is.Zero);
+            Assert.That(materializer.DestroyedValues, Does.Contain("cancelled-late"));
+            Assert.That(materializer.Active, Is.Empty);
         }
 
         [Test]
